@@ -1,0 +1,727 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AvionPulse — serverless member of the AvionDash suite (plain CloudFormation, no SAM).
+  Three tiers: CloudFront + S3 / API Gateway HTTP API + Lambda / DynamoDB + SQS.
+  Generates serverless telemetry and chaos faults for Datadog. Sized for the AWS free tier.
+  Requires the code zip from scripts/package.py uploaded to an S3 bucket in this region.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: '1. Code package (required)'}
+        Parameters: [CodeBucket, CodeKey]
+      - Label: {default: '2. Application'}
+        Parameters: [AppEnv, AppVersion, AdminPassword, SeedVersion]
+      - Label: {default: '3. Datadog (optional)'}
+        Parameters: [EnableDatadog, DatadogSite, DatadogApiKeySsmName, DatadogPythonLayerVersion,
+                     DatadogExtensionLayerVersion, RumApplicationId, RumClientToken]
+      - Label: {default: '4. Cost guards'}
+        Parameters: [ApiRateLimit, ApiBurstLimit, FaultTtlMinutes, LogRetentionDays, SimulatorSchedule,
+                     BudgetEmail, MonthlyBudgetUsd]
+    ParameterLabels:
+      CodeBucket: {default: S3 bucket holding the code zip}
+      CodeKey: {default: Object key of the code zip}
+      AdminPassword: {default: Admin password (blank = demo password aviondash123)}
+
+Parameters:
+  CodeBucket:
+    Type: String
+    MinLength: 3
+    Description: Name of an S3 bucket in THIS region that holds the zip built by scripts/package.py.
+  CodeKey:
+    Type: String
+    Default: avionpulse/avionpulse-code.zip
+    Description: Key of the code zip. Use a new key (package.py adds a content hash) to roll out code changes.
+  AppEnv:
+    Type: String
+    Default: demo
+    AllowedPattern: '[a-z0-9-]{1,20}'
+    Description: Value of the env tag (Datadog DD_ENV).
+  AppVersion:
+    Type: String
+    Default: 1.0.0
+  AdminPassword:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: Optional. Replaces the published demo password for the admin user (chaos access). Strongly recommended if others can reach the site.
+  SeedVersion:
+    Type: String
+    Default: '1'
+    Description: Change this value to reseed the table on the next stack update.
+  EnableDatadog:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+    Description: Attach the Datadog Python library + Extension layers. Requires the SSM parameter below to exist.
+  DatadogSite:
+    Type: String
+    Default: datadoghq.com
+    AllowedValues: [datadoghq.com, us3.datadoghq.com, us5.datadoghq.com, datadoghq.eu, ap1.datadoghq.com, ap2.datadoghq.com, ddog-gov.com]
+  DatadogApiKeySsmName:
+    Type: String
+    Default: /avionpulse/datadog/api-key
+    Description: SSM SecureString holding the Datadog API key (create it before enabling Datadog).
+  DatadogPythonLayerVersion:
+    Type: Number
+    Default: 107
+    Description: Version of layer Datadog-Python312-ARM (account 464622532012). Check Datadog docs for the latest.
+  DatadogExtensionLayerVersion:
+    Type: Number
+    Default: 80
+    Description: Version of layer Datadog-Extension-ARM (account 464622532012). Check Datadog docs for the latest.
+  RumApplicationId:
+    Type: String
+    Default: ''
+    Description: Optional Datadog RUM application id.
+  RumClientToken:
+    Type: String
+    Default: ''
+    Description: Optional Datadog RUM client token (public, starts with pub).
+  ApiRateLimit:
+    Type: Number
+    Default: 20
+    Description: Steady-state req/s ceiling on the HTTP API (restored after the api_throttling fault).
+  ApiBurstLimit:
+    Type: Number
+    Default: 40
+  FaultTtlMinutes:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 120
+    Description: Default minutes before an injected fault auto-reverts.
+  LogRetentionDays:
+    Type: Number
+    Default: 3
+    AllowedValues: [1, 3, 5, 7, 14]
+  SimulatorSchedule:
+    Type: String
+    Default: rate(5 minutes)
+  BudgetEmail:
+    Type: String
+    Default: ''
+    Description: Optional. If set, creates a monthly AWS Budget that emails this address.
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 5
+
+Conditions:
+  UseDatadog: !Equals [!Ref EnableDatadog, 'true']
+  CreateBudget: !Not [!Equals [!Ref BudgetEmail, '']]
+
+Resources:
+  # ════════════════════════════ DATA TIER ════════════════════════════════
+  Table:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub ${AWS::StackName}-data
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: {ReadCapacityUnits: 5, WriteCapacityUnits: 5}
+      AttributeDefinitions:
+        - {AttributeName: PK, AttributeType: S}
+        - {AttributeName: SK, AttributeType: S}
+      KeySchema:
+        - {AttributeName: PK, KeyType: HASH}
+        - {AttributeName: SK, KeyType: RANGE}
+      TimeToLiveSpecification: {AttributeName: ttl, Enabled: true}
+      Tags:
+        - {Key: app, Value: avionpulse}
+
+  EventsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-events-dlq
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      Tags:
+        - {Key: app, Value: avionpulse}
+
+  EventsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-events
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 86400
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EventsDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - {Key: app, Value: avionpulse}
+
+  # ════════════════════════════ WEB TIER ═════════════════════════════════
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      Tags:
+        - {Key: app, Value: avionpulse}
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal: {Service: cloudfront.amazonaws.com}
+            Action: s3:GetObject
+            Resource: !Sub ${SiteBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub AvionPulse (${AWS::StackName})
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        HttpVersion: http2and3
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig: {OriginAccessIdentity: ''}
+          - Id: api
+            DomainName: !Sub ${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              OriginReadTimeout: 30
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6   # Managed-CachingOptimized
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad          # Managed-CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # Managed-AllViewerExceptHostHeader
+      Tags:
+        - {Key: app, Value: avionpulse}
+
+  # ════════════════════════════ IAM ══════════════════════════════════════
+  ChaosInfraPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: AvionPulse runtime + chaos control-plane permissions
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: StageThrottle
+            Effect: Allow
+            Action: [apigateway:GET, apigateway:PATCH]
+            Resource: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/*/stages/*
+          - Sid: RecycleApiFunction
+            Effect: Allow
+            Action: [lambda:GetFunctionConfiguration, lambda:UpdateFunctionConfiguration]
+            Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-api
+          - Sid: WorkerConcurrency
+            Effect: Allow
+            Action: [lambda:PutFunctionConcurrency, lambda:DeleteFunctionConcurrency, lambda:GetFunctionConcurrency]
+            Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-worker
+          - Sid: ListMappings
+            Effect: Allow
+            Action: lambda:ListEventSourceMappings
+            Resource: '*'
+          - Sid: ToggleMappings
+            Effect: Allow
+            Action: [lambda:UpdateEventSourceMapping, lambda:GetEventSourceMapping]
+            Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:event-source-mapping:*
+          - Sid: Queues
+            Effect: Allow
+            Action: [sqs:SendMessage, sqs:GetQueueAttributes]
+            Resource: [!GetAtt EventsQueue.Arn, !GetAtt EventsDLQ.Arn]
+          - Sid: NotamObjects
+            Effect: Allow
+            Action: s3:GetObject
+            Resource: !Sub ${SiteBucket.Arn}/data/*
+          - Sid: ListBucketSoMissingKeysAre404
+            Effect: Allow
+            Action: s3:ListBucket
+            Resource: !GetAtt SiteBucket.Arn
+          - Sid: DatadogApiKey
+            Effect: Allow
+            Action: ssm:GetParameter
+            Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${DatadogApiKeySsmName}
+          - Sid: DecryptSsmDefaultKey
+            Effect: Allow
+            Action: kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub ssm.${AWS::Region}.amazonaws.com
+          # Intentionally NO permission on <stack>-data-restricted-ledger:
+          # the iam_access_denied fault depends on that gap.
+
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: AvionPulse api / worker / simulator / seed functions
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref ChaosInfraPolicy
+      Policies:
+        - PolicyName: data-tier
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Table
+                Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem,
+                         dynamodb:Query, dynamodb:Scan, dynamodb:BatchGetItem, dynamodb:BatchWriteItem,
+                         dynamodb:DescribeTable, dynamodb:ConditionCheckItem]
+                Resource: !GetAtt Table.Arn
+              - Sid: WorkerTrigger
+                Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
+                Resource: !GetAtt EventsQueue.Arn
+      Tags:
+        - {Key: app, Value: avionpulse}
+
+  SiteDeployerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: AvionPulse site deployer (copies web files, invalidates CloudFront)
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: publish-site
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:DeleteObject]
+                Resource: !Sub ${SiteBucket.Arn}/*
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt SiteBucket.Arn
+              - Effect: Allow
+                Action: cloudfront:CreateInvalidation
+                Resource: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+      Tags:
+        - {Key: app, Value: avionpulse}
+
+  # ════════════════════════════ APP TIER ═════════════════════════════════
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-api
+      RetentionInDays: !Ref LogRetentionDays
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-worker
+      RetentionInDays: !Ref LogRetentionDays
+  SimulatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-simulator
+      RetentionInDays: !Ref LogRetentionDays
+  SeedLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-seed
+      RetentionInDays: !Ref LogRetentionDays
+  SiteDeployerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-site-deployer
+      RetentionInDays: !Ref LogRetentionDays
+  ApiAccessLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/${AWS::StackName}-access
+      RetentionInDays: !Ref LogRetentionDays
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-api
+      Description: AvionPulse REST API + chaos engine
+      Runtime: python3.12
+      Architectures: [arm64]
+      MemorySize: 256
+      Timeout: 10
+      Role: !GetAtt AppRole.Arn
+      Handler: !If [UseDatadog, datadog_lambda.handler.handler, api.handler]
+      Code: {S3Bucket: !Ref CodeBucket, S3Key: !Ref CodeKey}
+      Layers: !If
+        - UseDatadog
+        - - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:464622532012:layer:Datadog-Python312-ARM:${DatadogPythonLayerVersion}
+          - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension-ARM:${DatadogExtensionLayerVersion}
+        - !Ref AWS::NoValue
+      LoggingConfig: {LogFormat: JSON, LogGroup: !Ref ApiLogGroup}
+      Environment:
+        Variables:
+          DD_LAMBDA_HANDLER: api.handler
+          TABLE_NAME: !Ref Table
+          QUEUE_URL: !Ref EventsQueue
+          DLQ_URL: !Ref EventsDLQ
+          BUCKET: !Ref SiteBucket
+          API_FN: !Sub ${AWS::StackName}-api
+          WORKER_FN: !Sub ${AWS::StackName}-worker
+          SIM_FN: !Sub ${AWS::StackName}-simulator
+          APP_ENV: !Ref AppEnv
+          APP_VERSION: !Ref AppVersion
+          DEFAULT_RATE: !Ref ApiRateLimit
+          DEFAULT_BURST: !Ref ApiBurstLimit
+          FAULT_TTL_MIN: !Ref FaultTtlMinutes
+          DD_SITE: !Ref DatadogSite
+          DD_API_KEY_SSM_NAME: !Ref DatadogApiKeySsmName
+          DD_ENV: !Ref AppEnv
+          DD_SERVICE: avionpulse
+          DD_VERSION: !Ref AppVersion
+          DD_TRACE_ENABLED: 'true'
+          DD_SERVERLESS_LOGS_ENABLED: 'true'
+          DD_LOGS_INJECTION: 'true'
+          DD_ENHANCED_METRICS: 'true'
+          DD_COLD_START_TRACING: 'true'
+          DD_CAPTURE_LAMBDA_PAYLOAD: 'false'
+          DD_MERGE_XRAY_TRACES: 'false'
+          DD_TAGS: !Sub 'app:avionpulse,suite:aviondash,stack:${AWS::StackName}'
+      Tags:
+        - {Key: app, Value: avionpulse}
+
+  WorkerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-worker
+      Description: AvionPulse SQS consumer (ops + maintenance events)
+      Runtime: python3.12
+      Architectures: [arm64]
+      MemorySize: 256
+      Timeout: 10
+      Role: !GetAtt AppRole.Arn
+      Handler: !If [UseDatadog, datadog_lambda.handler.handler, worker.handler]
+      Code: {S3Bucket: !Ref CodeBucket, S3Key: !Ref CodeKey}
+      Layers: !If
+        - UseDatadog
+        - - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:464622532012:layer:Datadog-Python312-ARM:${DatadogPythonLayerVersion}
+          - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension-ARM:${DatadogExtensionLayerVersion}
+        - !Ref AWS::NoValue
+      LoggingConfig: {LogFormat: JSON, LogGroup: !Ref WorkerLogGroup}
+      Environment:
+        Variables:
+          DD_LAMBDA_HANDLER: worker.handler
+          TABLE_NAME: !Ref Table
+          QUEUE_URL: !Ref EventsQueue
+          DLQ_URL: !Ref EventsDLQ
+          BUCKET: !Ref SiteBucket
+          API_FN: !Sub ${AWS::StackName}-api
+          WORKER_FN: !Sub ${AWS::StackName}-worker
+          SIM_FN: !Sub ${AWS::StackName}-simulator
+          APP_ENV: !Ref AppEnv
+          APP_VERSION: !Ref AppVersion
+          DEFAULT_RATE: !Ref ApiRateLimit
+          DEFAULT_BURST: !Ref ApiBurstLimit
+          FAULT_TTL_MIN: !Ref FaultTtlMinutes
+          DD_SITE: !Ref DatadogSite
+          DD_API_KEY_SSM_NAME: !Ref DatadogApiKeySsmName
+          DD_ENV: !Ref AppEnv
+          DD_SERVICE: avionpulse
+          DD_VERSION: !Ref AppVersion
+          DD_TRACE_ENABLED: 'true'
+          DD_SERVERLESS_LOGS_ENABLED: 'true'
+          DD_LOGS_INJECTION: 'true'
+          DD_ENHANCED_METRICS: 'true'
+          DD_COLD_START_TRACING: 'true'
+          DD_CAPTURE_LAMBDA_PAYLOAD: 'false'
+          DD_MERGE_XRAY_TRACES: 'false'
+          DD_TAGS: !Sub 'app:avionpulse,suite:aviondash,stack:${AWS::StackName}'
+      Tags:
+        - {Key: app, Value: avionpulse}
+
+  WorkerTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt EventsQueue.Arn
+      FunctionName: !Ref WorkerFunction
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      Enabled: true
+
+  SimulatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-simulator
+      Description: AvionPulse flight simulator, business metrics and chaos janitor
+      Runtime: python3.12
+      Architectures: [arm64]
+      MemorySize: 256
+      Timeout: 30
+      Role: !GetAtt AppRole.Arn
+      Handler: !If [UseDatadog, datadog_lambda.handler.handler, simulator.handler]
+      Code: {S3Bucket: !Ref CodeBucket, S3Key: !Ref CodeKey}
+      Layers: !If
+        - UseDatadog
+        - - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:464622532012:layer:Datadog-Python312-ARM:${DatadogPythonLayerVersion}
+          - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension-ARM:${DatadogExtensionLayerVersion}
+        - !Ref AWS::NoValue
+      LoggingConfig: {LogFormat: JSON, LogGroup: !Ref SimulatorLogGroup}
+      Environment:
+        Variables:
+          DD_LAMBDA_HANDLER: simulator.handler
+          TABLE_NAME: !Ref Table
+          QUEUE_URL: !Ref EventsQueue
+          DLQ_URL: !Ref EventsDLQ
+          BUCKET: !Ref SiteBucket
+          API_FN: !Sub ${AWS::StackName}-api
+          WORKER_FN: !Sub ${AWS::StackName}-worker
+          SIM_FN: !Sub ${AWS::StackName}-simulator
+          APP_ENV: !Ref AppEnv
+          APP_VERSION: !Ref AppVersion
+          DEFAULT_RATE: !Ref ApiRateLimit
+          DEFAULT_BURST: !Ref ApiBurstLimit
+          FAULT_TTL_MIN: !Ref FaultTtlMinutes
+          DD_SITE: !Ref DatadogSite
+          DD_API_KEY_SSM_NAME: !Ref DatadogApiKeySsmName
+          DD_ENV: !Ref AppEnv
+          DD_SERVICE: avionpulse
+          DD_VERSION: !Ref AppVersion
+          DD_TRACE_ENABLED: 'true'
+          DD_SERVERLESS_LOGS_ENABLED: 'true'
+          DD_LOGS_INJECTION: 'true'
+          DD_ENHANCED_METRICS: 'true'
+          DD_COLD_START_TRACING: 'true'
+          DD_CAPTURE_LAMBDA_PAYLOAD: 'false'
+          DD_MERGE_XRAY_TRACES: 'false'
+          DD_TAGS: !Sub 'app:avionpulse,suite:aviondash,stack:${AWS::StackName}'
+      Tags:
+        - {Key: app, Value: avionpulse}
+
+  SimulatorRetries:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref SimulatorFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 1
+
+  SimulatorTick:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: AvionPulse simulator tick
+      ScheduleExpression: !Ref SimulatorSchedule
+      State: ENABLED
+      Targets:
+        - Id: simulator
+          Arn: !GetAtt SimulatorFunction.Arn
+
+  SimulatorTickPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SimulatorFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SimulatorTick.Arn
+
+  # ── API Gateway HTTP API ───────────────────────────────────────────────
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub ${AWS::StackName}-http
+      Description: AvionPulse API (reached via CloudFront /api/*)
+      ProtocolType: HTTP
+      Tags: {app: avionpulse}
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiFunction.Arn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 30000
+
+  ApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: ANY /api/{proxy+}
+      Target: !Sub integrations/${ApiIntegration}
+
+  # Chaos + auth get their own routes so their throttle survives the
+  # api_throttling fault (which only rewrites DefaultRouteSettings).
+  ChaosRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: ANY /api/chaos/{proxy+}
+      Target: !Sub integrations/${ApiIntegration}
+
+  AuthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: ANY /api/auth/{proxy+}
+      Target: !Sub integrations/${ApiIntegration}
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    DependsOn: [ApiRoute, ChaosRoute, AuthRoute]
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingRateLimit: !Ref ApiRateLimit
+        ThrottlingBurstLimit: !Ref ApiBurstLimit
+      RouteSettings:
+        'ANY /api/chaos/{proxy+}': {ThrottlingRateLimit: 5, ThrottlingBurstLimit: 10}
+        'ANY /api/auth/{proxy+}': {ThrottlingRateLimit: 5, ThrottlingBurstLimit: 10}
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogs.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","method":"$context.httpMethod","path":"$context.path","status":"$context.status","latency_ms":"$context.responseLatency","integration_latency_ms":"$context.integrationLatency","integration_error":"$context.integrationErrorMessage","error":"$context.error.message"}'
+      Tags: {app: avionpulse}
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ApiFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*
+
+  # ════════════════════════════ DEPLOY-TIME HELPERS ══════════════════════
+  SeedFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-seed
+      Description: AvionPulse table seeder (custom resource)
+      Runtime: python3.12
+      Architectures: [arm64]
+      MemorySize: 256
+      Timeout: 120
+      Role: !GetAtt AppRole.Arn
+      Handler: seed.handler
+      Code: {S3Bucket: !Ref CodeBucket, S3Key: !Ref CodeKey}
+      LoggingConfig: {LogFormat: JSON, LogGroup: !Ref SeedLogGroup}
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref Table
+          QUEUE_URL: !Ref EventsQueue
+          DLQ_URL: !Ref EventsDLQ
+          APP_ENV: !Ref AppEnv
+      Tags:
+        - {Key: app, Value: avionpulse}
+
+  SeedData:
+    Type: Custom::AvionPulseSeed
+    Properties:
+      ServiceToken: !GetAtt SeedFunction.Arn
+      SeedVersion: !Ref SeedVersion
+      AdminPassword: !Ref AdminPassword
+
+  SiteDeployerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-site-deployer
+      Description: Copies the SPA into the site bucket and invalidates CloudFront (custom resource)
+      Runtime: python3.12
+      Architectures: [arm64]
+      MemorySize: 256
+      Timeout: 300
+      Role: !GetAtt SiteDeployerRole.Arn
+      Handler: site_deployer.handler
+      Code: {S3Bucket: !Ref CodeBucket, S3Key: !Ref CodeKey}
+      LoggingConfig: {LogFormat: JSON, LogGroup: !Ref SiteDeployerLogGroup}
+      Tags:
+        - {Key: app, Value: avionpulse}
+
+  SiteDeployment:
+    Type: Custom::AvionPulseSite
+    DependsOn: [SiteBucketPolicy]
+    Properties:
+      ServiceToken: !GetAtt SiteDeployerFunction.Arn
+      Bucket: !Ref SiteBucket
+      DistributionId: !Ref Distribution
+      CodeKey: !Ref CodeKey
+      AppEnv: !Ref AppEnv
+      AppVersion: !Ref AppVersion
+      DatadogSite: !Ref DatadogSite
+      RumApplicationId: !Ref RumApplicationId
+      RumClientToken: !Ref RumClientToken
+
+  # ════════════════════════════ COST GUARD ═══════════════════════════════
+  CostBudget:
+    Type: AWS::Budgets::Budget
+    Condition: CreateBudget
+    Properties:
+      Budget:
+        BudgetName: !Sub ${AWS::StackName}-monthly
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: {Amount: !Ref MonthlyBudgetUsd, Unit: USD}
+      NotificationsWithSubscribers:
+        - Notification: {NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 50, ThresholdType: PERCENTAGE}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref BudgetEmail}]
+        - Notification: {NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref BudgetEmail}]
+
+Outputs:
+  SiteUrl:
+    Description: Open this in a browser
+    Value: !Sub https://${Distribution.DomainName}
+  DistributionId:
+    Value: !Ref Distribution
+  BucketName:
+    Value: !Ref SiteBucket
+  ApiEndpoint:
+    Description: Direct API Gateway URL (bypasses CloudFront)
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+  ApiId:
+    Value: !Ref HttpApi
+  TableName:
+    Value: !Ref Table
+  QueueUrl:
+    Value: !Ref EventsQueue
+  DeadLetterQueueUrl:
+    Value: !Ref EventsDLQ
+  ApiFunctionName:
+    Value: !Ref ApiFunction
+  CodeKey:
+    Description: Code package currently deployed
+    Value: !Ref CodeKey
